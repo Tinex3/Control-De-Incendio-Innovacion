@@ -1,0 +1,3 @@
+[submodule "Maqueta-web"]
+	path = Maqueta-web
+	url = git@github.com:Tinex3/Maqueta-web.git

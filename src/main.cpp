@@ -1,111 +1,127 @@
-#include <Arduino.h>
-#include "stdint.h"
-#include <Wire.h> 
-#include <LiquidCrystal_I2C.h>
-#include "max6675.h"
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <max6675.h>
 
-typedef struct{
-	TaskHandle_t main_Task_Handle;
-	QueueHandle_t main_Task_CMD_Queue;
-	TaskHandle_t calling_task;
-}RTOS_API;
+// Definición de pines para MAX6675
+int thermoDO1 = 19; // Termopar 1
+int thermoCS1 = 5;
+int thermoCLK1 = 18;
 
+int thermoDO2 = 19; // Termopar 2
+int thermoCS2 = 17;
+int thermoCLK2 = 18;
 
-// Definimos los pines para los dos sensores MAX6675
-const int CS_PIN1 = 5;   // Chip Select para el primer sensor
-const int CS_PIN2 = 4;   // Chip Select para el segundo sensor
-const int SCK_PIN = 18;  // Serial Clock (compartido)
-const int SO_PIN = 19;   // Serial Output (compartido)
+// Definición de pines para LM35 y sensor de calidad de aire
+const int lm35Pin = 34;
+const int airQualityPin = 35;
 
-// Creación de las instancias del sensor
-MAX6675 thermocouple1(SCK_PIN, CS_PIN1, SO_PIN);
-MAX6675 thermocouple2(SCK_PIN, CS_PIN2, SO_PIN);
+// Inicialización de objetos MAX6675
+MAX6675 thermocouple1(thermoCLK1, thermoCS1, thermoDO1);
+MAX6675 thermocouple2(thermoCLK2, thermoCS2, thermoDO2);
 
-// Variables globales para almacenar las temperaturas
-float temperature1 = 0.0;
-float temperature2 = 0.0;
+// Configuración WiFi
+const char* ssid = "TU_SSID";
+const char* password = "TU_PASSWORD";
 
-// Declaración de las tareas
-void TaskReadSensors(void *pvParameters);
-void TaskPrintData(void *pvParameters);
+// Crear servidor web
+AsyncWebServer server(80);
 
-typedef struct {
-  float temperature1;
-  float temperature2;
-} SensorData;
+// HTML de la página web
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Monitor de Sensores</title>
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f8f9fa;
+    }
+    .container {
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      background-color: #fff;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+    }
+    .sensor-data {
+      font-size: 1.5em;
+      margin: 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 class="text-center">Monitor de Sensores</h1>
+    <div class="sensor-data">
+      <p>Termopar 1: <span id="tempC1">--</span> °C</p>
+      <p>Termopar 2: <span id="tempC2">--</span> °C</p>
+      <p>LM35: <span id="tempC3">--</span> °C</p>
+      <p>Calidad de aire: <span id="airQuality">--</span></p>
+    </div>
+  </div>
+  <script>
+    setInterval(function () {
+      fetch('/sensor-data')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('tempC1').innerText = data.tempC1;
+          document.getElementById('tempC2').innerText = data.tempC2;
+          document.getElementById('tempC3').innerText = data.tempC3;
+          document.getElementById('airQuality').innerText = data.airQuality;
+        });
+    }, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
 
 void setup() {
-  // Inicializamos la comunicación serie
   Serial.begin(115200);
-  while (!Serial) {
-    ; // Esperamos a que se inicie el puerto serie
+  Serial.println("Iniciando lectura de sensores...");
+  delay(500); // Espera inicial para estabilización de sensores
+
+  // Conexión WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Conectando a WiFi...");
   }
+  Serial.println("Conectado a WiFi");
+  Serial.println(WiFi.localIP());
 
-  // Esperamos a que los sensores se estabilicen
-  delay(500);
+  // Ruta para servir la página web
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
 
-  // Creación de las tareas
-  xTaskCreate(
-    TaskReadSensors,     // Función de la tarea
-    "ReadSensors Task",  // Nombre de la tarea (para depuración)
-    2048,                // Tamaño de la pila (en palabras)
-    NULL,                // Parámetros que se pasan a la tarea
-    1,                   // Prioridad de la tarea
-    NULL                 // Handle de la tarea (no se utiliza aquí)
-  );
+  // Ruta para obtener los datos de los sensores
+  server.on("/sensor-data", HTTP_GET, [](AsyncWebServerRequest *request){
+    double tempC1 = thermocouple1.readCelsius();
+    double tempC2 = thermocouple2.readCelsius();
+    int lm35Value = analogRead(lm35Pin);
+    float voltage = lm35Value * (3.3 / 4095.0);
+    float tempC3 = voltage * 100;
+    int airQualityValue = analogRead(airQualityPin);
 
-  xTaskCreate(
-    TaskPrintData,       // Función de la tarea
-    "PrintData Task",    // Nombre de la tarea (para depuración)
-    2048,                // Tamaño de la pila (en palabras)
-    NULL,                // Parámetros que se pasan a la tarea
-    1,                   // Prioridad de la tarea
-    NULL                 // Handle de la tarea (no se utiliza aquí)
-  );
-  xTaskCreate(
-    TaskPrintData,       // Función de la tarea
-    "PrintData Task",    // Nombre de la tarea (para depuración)
-    2048,                // Tamaño de la pila (en palabras)
-    NULL,                // Parámetros que se pasan a la tarea
-    1,                   // Prioridad de la tarea
-    NULL                 // Handle de la tarea (no se utiliza aquí)
-  );
+    String json = "{";
+    json += "\"tempC1\":" + String(tempC1) + ",";
+    json += "\"tempC2\":" + String(tempC2) + ",";
+    json += "\"tempC3\":" + String(tempC3) + ",";
+    json += "\"airQuality\":" + String(airQualityValue);
+    json += "}";
+
+    request->send(200, "application/json", json);
+  });
+
+  // Inicia el servidor
+  server.begin();
 }
 
 void loop() {
-  // El loop se deja vacío ya que FreeRTOS maneja las tareas
-  
-}
-
-// Implementación de la tarea TaskReadSensors
-void TaskReadSensors(void *pvParameters) {
-  (void) pvParameters;
-
-  for (;;) {
-    // Leer temperatura de los sensores
-    temperature1 = thermocouple1.readCelsius();
-    temperature2 = thermocouple2.readCelsius();
-
-    // Simular un pequeño retardo para la lectura de sensores
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Esperamos 1 segundo
-  }
-}
-
-// Implementación de la tarea TaskPrintData
-void TaskPrintData(void *pvParameters) {
-  (void) pvParameters;
-
-  for (;;) {
-    // Imprimir las temperaturas en el monitor serie
-    Serial.print("Temperature 1: ");
-    Serial.print(temperature1);
-    Serial.println(" °C");
-
-    Serial.print("Temperature 2: ");
-    Serial.print(temperature2);
-    Serial.println(" °C");
-
-    // Simular un pequeño retardo para la impresión de datos
-    vTaskDelay(2000 / portTICK_PERIOD_MS); // Esperamos 2 segundos
-  }
+  // No es necesario poner nada aquí ya que el servidor maneja las peticiones de manera asíncrona
 }
